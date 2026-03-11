@@ -74,6 +74,7 @@ class ChatResponse(BaseModel):
     message: str
     session_id: str
     tourCarousel: dict[str, Any] | None = None
+    productCarousel: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
 
 

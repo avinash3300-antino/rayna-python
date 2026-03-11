@@ -41,6 +41,7 @@ async def chat(request: Request, body: ChatRequest) -> JSONResponse:
                 "message": result["reply"],
                 "session_id": session_id,
                 "tourCarousel": result.get("tourCarousel"),
+                "productCarousel": result.get("productCarousel"),
                 "metadata": result.get("metadata"),
             },
         )

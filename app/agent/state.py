@@ -15,6 +15,7 @@ class AgentState(TypedDict, total=False):
     rag_context: str
     final_reply: str
     tour_carousel: dict[str, Any] | None
+    product_carousel: dict[str, Any] | None
     metadata: dict[str, Any] | None
     provider_used: str
     enhanced_system_prompt: str

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -39,6 +40,167 @@ from app.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 5
+
+
+def _is_product_item(item: dict[str, Any]) -> bool:
+    """Check if a dict looks like a real product (has name + price or url)."""
+    has_name = bool(item.get("name") or item.get("title"))
+    has_price = any(item.get(k) for k in ("normalPrice", "salePrice", "price", "currentPrice", "originalPrice"))
+    has_url = bool(item.get("url") or item.get("productUrl"))
+    # Must have a name AND at least price or url to be a real product
+    return has_name and (has_price or has_url)
+
+
+def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
+    """Recursively search for a list of product-like dicts in nested API response."""
+    if depth > 6:
+        return []
+
+    # If it's already a list of dicts that look like real products, return it
+    if isinstance(data, list) and data:
+        if isinstance(data[0], dict) and _is_product_item(data[0]):
+            return data
+        # Search within list items
+        for item in data:
+            if isinstance(item, dict):
+                result = _find_product_list(item, depth + 1)
+                if result:
+                    return result
+        return []
+
+    if isinstance(data, dict):
+        # Check known keys for product lists first (prioritize "products" key)
+        for key in ("products", "packages", "holidays", "cruises", "yachts", "items", "results"):
+            val = data.get(key)
+            if isinstance(val, list) and val and isinstance(val[0], dict) and _is_product_item(val[0]):
+                return val
+        # Recurse into dict values (check "data" key last to avoid matching sub-objects)
+        for key in ("data",):
+            val = data.get(key)
+            if isinstance(val, (dict, list)):
+                result = _find_product_list(val, depth + 1)
+                if result:
+                    return result
+        # Recurse into other dict values
+        for k, val in data.items():
+            if k in ("products", "packages", "holidays", "cruises", "yachts", "items", "results", "data"):
+                continue  # Already checked above
+            if isinstance(val, (dict, list)):
+                result = _find_product_list(val, depth + 1)
+                if result:
+                    return result
+    return []
+
+
+def _extract_product_cards(data: dict[str, Any], carousel_type: str) -> list[dict[str, Any]]:
+    """Extract product cards from raw API response for holidays, cruises, yachts."""
+    products = _find_product_list(data)
+
+    logger.info(
+        "[CardExtract] carousel_type=%s, found %d products, data_keys=%s",
+        carousel_type, len(products),
+        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+    )
+    if products:
+        logger.info("[CardExtract] First product keys: %s", list(products[0].keys()))
+
+    cards = []
+    for p in products[:12]:
+        if not isinstance(p, dict):
+            continue
+        card = {
+            "id": p.get("id") or p.get("productId") or p.get("slug", ""),
+            "title": p.get("name") or p.get("title") or "",
+            "image": p.get("image") or p.get("imageUrl") or p.get("thumbnail") or "",
+            "location": p.get("city") or p.get("location") or p.get("cityName") or "",
+            "category": p.get("category") or p.get("productCategory") or p.get("type") or carousel_type.replace("_carousel", ""),
+            "originalPrice": _safe_float(p.get("normalPrice") or p.get("originalPrice") or p.get("price")),
+            "currentPrice": _safe_float(p.get("salePrice") or p.get("currentPrice") or p.get("price") or p.get("normalPrice")),
+            "currency": p.get("currency") or "AED",
+            "duration": p.get("duration") or p.get("noOfDays") or "",
+            "url": p.get("url") or p.get("productUrl") or "",
+            "slug": p.get("slug") or p.get("url") or "",
+        }
+        # Include amenities/inclusions for holidays
+        if carousel_type == "holiday_carousel":
+            card["amenities"] = p.get("amenities") or p.get("inclusions") or []
+        # Accept card if it has a title (don't filter on price — some may be 0 / free)
+        if card["title"]:
+            cards.append(card)
+
+    logger.info("[CardExtract] Built %d cards from %d products", len(cards), len(products))
+    return cards
+
+
+def _safe_float(val: Any) -> float:
+    """Convert value to float safely, return 0.0 on failure."""
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _carousel_title(carousel_type: str, inp: dict[str, Any]) -> str:
+    """Generate a nice carousel title."""
+    labels = {
+        "holiday_carousel": "Holiday Packages",
+        "cruise_carousel": "Cruises",
+        "yacht_carousel": "Yacht Experiences",
+    }
+    label = labels.get(carousel_type, "Experiences")
+    return f"🌟 {label}"
+
+
+def _sanitize_reply(text: str) -> str:
+    """Strip raw JSON blocks, HTML-like tags, and card markup the LLM may have dumped."""
+    if not text:
+        return text
+
+    # Remove <CAROUSEL ...>, <holiday-cards>, [HOLIDAY_CARDS], etc. and their contents
+    # Pattern: <TAG ...> ... </TAG> or <TAG ... />
+    text = re.sub(
+        r'<(?:CAROUSEL|holiday-cards|cruise-cards|yacht-cards|tour-cards)[^>]*>.*?</(?:CAROUSEL|holiday-cards|cruise-cards|yacht-cards|tour-cards)>',
+        '', text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Self-closing tags: <CAROUSEL ... />
+    text = re.sub(
+        r'<(?:CAROUSEL|holiday-cards|cruise-cards|yacht-cards|tour-cards)[^>]*/\s*>',
+        '', text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Opening tags without closing (LLM sometimes doesn't close): <TAG ...> followed by JSON
+    text = re.sub(
+        r'<(?:CAROUSEL|holiday-cards|cruise-cards|yacht-cards|tour-cards)[^>]*>',
+        '', text, flags=re.IGNORECASE,
+    )
+
+    # Remove [HOLIDAY_CARDS], [TOUR_CARDS], etc. bracket markers + JSON block after them
+    text = re.sub(
+        r'\[(?:HOLIDAY_CARDS|TOUR_CARDS|CRUISE_CARDS|YACHT_CARDS)\]\s*\{.*?\}\s*',
+        '', text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r'\[(?:HOLIDAY_CARDS|TOUR_CARDS|CRUISE_CARDS|YACHT_CARDS)\]\s*\[.*?\]\s*',
+        '', text, flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Remove large inline JSON blocks (arrays/objects with "products", "name", "price", etc.)
+    # Match JSON objects/arrays that look like product data (> 200 chars with product-like keys)
+    text = re.sub(
+        r'\{"products"\s*:\s*\[.*?\]\s*\}',
+        '', text, flags=re.DOTALL,
+    )
+    # Standalone JSON arrays with product-like objects
+    text = re.sub(
+        r'\[\s*\{\s*"(?:id|name|title|price|url|image)".*?\}\s*\]',
+        '', text, flags=re.DOTALL,
+    )
+
+    # Clean up leftover whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 
 # Module-level singletons (initialised once in main.py lifespan)
 _llm: LLMProvider | None = None
@@ -119,26 +281,68 @@ async def execute_tools(state: AgentState) -> AgentState:
     tool_calls = state.get("tool_results", [])
     session_id = state.get("session_id", "")
     tour_carousel = state.get("tour_carousel")
+    product_carousel = state.get("product_carousel")
     metadata = state.get("metadata")
+
+    # Tools that return product lists which should be rendered as cards
+    PRODUCT_CARD_TOOLS = {
+        "get_city_holiday_packages": "holiday_carousel",
+        "get_city_cruises": "cruise_carousel",
+        "get_city_yachts": "yacht_carousel",
+    }
 
     async def _run_one(call: dict[str, Any]) -> dict[str, str]:
         result = await ToolRegistry.execute(call["name"], call["input"], session_id)
+
+        nonlocal tour_carousel, product_carousel, metadata
 
         # Capture tour carousel data (same as Node.js)
         if call["name"] == "get_tour_cards" and result:
             try:
                 parsed = json.loads(result) if isinstance(result, str) else result
                 if parsed.get("success") and parsed.get("data", {}).get("carousel"):
-                    nonlocal tour_carousel, metadata
                     tour_carousel = parsed["data"]["carousel"]
+                    product_carousel = tour_carousel
                     metadata = {
                         "hasCards": True,
+                        "cardType": "tour_carousel",
                         "cardCount": len(parsed["data"]["carousel"].get("cards", [])),
                         "totalResults": parsed["data"].get("totalResults", 0),
                     }
                     logger.info("[AgentLoop] Tour cards retrieved: %d cards", metadata["cardCount"])
             except Exception:
                 logger.exception("[AgentLoop] Error parsing tour cards result")
+
+        # Capture holiday/cruise/yacht data and build carousel
+        elif call["name"] in PRODUCT_CARD_TOOLS and result:
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+                logger.info(
+                    "[AgentLoop] %s raw result keys: %s, success=%s, has_data=%s",
+                    call["name"],
+                    list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__,
+                    parsed.get("success"),
+                    bool(parsed.get("data")),
+                )
+                if parsed.get("success") and parsed.get("data"):
+                    carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
+                    cards = _extract_product_cards(parsed["data"], carousel_type)
+                    if cards:
+                        product_carousel = {
+                            "type": carousel_type,
+                            "title": _carousel_title(carousel_type, call["input"]),
+                            "cards": cards,
+                            "totalResults": len(cards),
+                        }
+                        metadata = {
+                            "hasCards": True,
+                            "cardType": carousel_type,
+                            "cardCount": len(cards),
+                            "totalResults": len(cards),
+                        }
+                        logger.info("[AgentLoop] %s cards retrieved: %d cards", carousel_type, len(cards))
+            except Exception:
+                logger.exception("[AgentLoop] Error parsing %s result", call["name"])
 
         logger.info("[AgentLoop] Tool '%s' completed", call["name"])
         return {"id": call["id"], "content": result if isinstance(result, str) else json.dumps(result)}
@@ -153,6 +357,7 @@ async def execute_tools(state: AgentState) -> AgentState:
         "messages": messages,
         "tool_results": [],
         "tour_carousel": tour_carousel,
+        "product_carousel": product_carousel,
         "metadata": metadata,
     }
 
@@ -161,8 +366,9 @@ async def save_turn(state: AgentState) -> AgentState:
     """Persist message to MongoDB + update in-memory session."""
     assert _session_service is not None
     session_id = state.get("session_id", "")
-    final_reply = state.get("final_reply", "")
+    final_reply = _sanitize_reply(state.get("final_reply", ""))
     tour_carousel = state.get("tour_carousel")
+    product_carousel = state.get("product_carousel")
 
     _session_service.add_message(session_id, {"role": "assistant", "content": final_reply})
 
@@ -171,7 +377,7 @@ async def save_turn(state: AgentState) -> AgentState:
             session_id=session_id,
             role="assistant",
             content=final_reply,
-            tour_carousel=tour_carousel,
+            tour_carousel=product_carousel or tour_carousel,
         )
         await ConversationRepository.increment_count(session_id)
 
@@ -276,6 +482,7 @@ async def run_agent(
         "rag_context": "",
         "final_reply": "",
         "tour_carousel": None,
+        "product_carousel": None,
         "metadata": None,
         "provider_used": "",
         "enhanced_system_prompt": SYSTEM_PROMPT,
@@ -284,9 +491,13 @@ async def run_agent(
 
     final_state = await graph.ainvoke(initial_state)
 
+    # Sanitize the reply — strip any raw JSON/tags the LLM may have dumped
+    reply = _sanitize_reply(final_state.get("final_reply", ""))
+
     return {
-        "reply": final_state.get("final_reply", ""),
+        "reply": reply,
         "session_id": session_id,
         "tourCarousel": final_state.get("tour_carousel"),
+        "productCarousel": final_state.get("product_carousel"),
         "metadata": final_state.get("metadata"),
     }
