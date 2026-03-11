@@ -2,6 +2,7 @@
 Multi-LLM provider abstraction — exact port of src/chat/llm.provider.ts.
 Supports Claude (Anthropic), OpenAI, Groq, and Grok (xAI).
 All providers normalise to Anthropic-style rawContent for the agent loop.
+Streaming support added for real-time token delivery via SSE.
 """
 
 from __future__ import annotations
@@ -9,8 +10,8 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -27,6 +28,23 @@ class LLMResponse:
     stop_reason: str
 
 
+@dataclass
+class StreamEvent:
+    """A single event from a streaming LLM response."""
+    type: str  # "token", "tool_use_start", "tool_use_delta", "tool_use_end", "done"
+    content: str = ""
+    tool_call: dict[str, Any] | None = None
+
+
+@dataclass
+class StreamResult:
+    """Accumulated result after streaming completes."""
+    text: str = ""
+    raw_content: list[Any] = field(default_factory=list)
+    stop_reason: str = "end_turn"
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
 class LLMProvider(ABC):
     @abstractmethod
     async def chat(
@@ -35,6 +53,21 @@ class LLMProvider(ABC):
         system_prompt: str,
         tools: list[dict[str, Any]],
     ) -> LLMResponse: ...
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream LLM response token by token. Default falls back to non-streaming."""
+        response = await self.chat(messages, system_prompt, tools)
+        if response.text:
+            yield StreamEvent(type="token", content=response.text)
+        for block in response.raw_content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                yield StreamEvent(type="tool_use_end", tool_call=block)
+        yield StreamEvent(type="done")
 
     def is_tool_use(self, response: LLMResponse) -> bool:
         return response.stop_reason == "tool_use"
@@ -98,6 +131,63 @@ class ClaudeProvider(LLMProvider):
             raw_content=raw_content,
             stop_reason=response.stop_reason or "end_turn",
         )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream Claude response — yields tokens in real-time."""
+        async with self._client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=system_prompt,
+            tools=tools,  # type: ignore[arg-type]
+            messages=messages,  # type: ignore[arg-type]
+        ) as stream:
+            current_tool: dict[str, Any] | None = None
+            tool_json_parts: list[str] = []
+
+            async for event in stream:
+                # Text tokens — stream immediately
+                if event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        yield StreamEvent(type="token", content=event.delta.text)
+                    elif hasattr(event.delta, "partial_json"):
+                        tool_json_parts.append(event.delta.partial_json)
+
+                # New content block starting
+                elif event.type == "content_block_start":
+                    if hasattr(event.content_block, "type") and event.content_block.type == "tool_use":
+                        current_tool = {
+                            "type": "tool_use",
+                            "id": event.content_block.id,
+                            "name": event.content_block.name,
+                            "input": {},
+                        }
+                        tool_json_parts = []
+                        yield StreamEvent(
+                            type="tool_use_start",
+                            content=event.content_block.name,
+                        )
+
+                # Content block finished
+                elif event.type == "content_block_stop":
+                    if current_tool is not None:
+                        try:
+                            current_tool["input"] = json.loads("".join(tool_json_parts)) if tool_json_parts else {}
+                        except json.JSONDecodeError:
+                            current_tool["input"] = {}
+                        yield StreamEvent(type="tool_use_end", tool_call=current_tool)
+                        current_tool = None
+                        tool_json_parts = []
+
+            # Get the final message for stop_reason
+            final_message = await stream.get_final_message()
+            stop_reason = final_message.stop_reason or "end_turn"
+
+        yield StreamEvent(type="done", content=stop_reason)
 
 
 # ─────────────────────────────────────────────────────────
@@ -195,6 +285,79 @@ class OpenAIProvider(LLMProvider):
         stop_reason = "tool_use" if message.tool_calls else "end_turn"
         return LLMResponse(text=message.content or "", raw_content=raw_content, stop_reason=stop_reason)
 
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream OpenAI response token by token."""
+        openai_messages = self._convert_messages(messages, system_prompt)
+        openai_tools = self._convert_tools(tools)
+        stream = await self._client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=openai_messages,  # type: ignore[arg-type]
+            tools=openai_tools,  # type: ignore[arg-type]
+            tool_choice="auto",
+            max_tokens=2048,
+            stream=True,
+        )
+
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+
+            # Text content
+            if delta.content:
+                yield StreamEvent(type="token", content=delta.content)
+
+            # Tool calls accumulation
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": tc_delta.id or "",
+                            "name": tc_delta.function.name if tc_delta.function and tc_delta.function.name else "",
+                            "arguments": "",
+                        }
+                        if tool_calls_acc[idx]["name"]:
+                            yield StreamEvent(type="tool_use_start", content=tool_calls_acc[idx]["name"])
+                    if tc_delta.id:
+                        tool_calls_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_acc[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+            # Check finish reason
+            finish = chunk.choices[0].finish_reason if chunk.choices else None
+            if finish:
+                break
+
+        # Emit accumulated tool calls
+        for tc_data in tool_calls_acc.values():
+            try:
+                inp = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
+            except json.JSONDecodeError:
+                inp = {}
+            yield StreamEvent(
+                type="tool_use_end",
+                tool_call={
+                    "type": "tool_use",
+                    "id": tc_data["id"],
+                    "name": tc_data["name"],
+                    "input": inp,
+                },
+            )
+
+        stop = "tool_use" if tool_calls_acc else "end_turn"
+        yield StreamEvent(type="done", content=stop)
+
 
 # ─────────────────────────────────────────────────────────
 # Groq Provider
@@ -241,6 +404,64 @@ class GroqProvider(LLMProvider):
                 )
         stop_reason = "tool_use" if message.tool_calls else "end_turn"
         return LLMResponse(text=message.content or "", raw_content=raw_content, stop_reason=stop_reason)
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str,
+        tools: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream Groq response token by token (same format as OpenAI)."""
+        groq_messages = OpenAIProvider._convert_messages(messages, system_prompt)
+        groq_tools = OpenAIProvider._convert_tools(tools)
+        stream = await self._client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=groq_messages,  # type: ignore[arg-type]
+            tools=groq_tools,  # type: ignore[arg-type]
+            tool_choice="auto",
+            max_tokens=2048,
+            stream=True,
+        )
+
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+            if delta.content:
+                yield StreamEvent(type="token", content=delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": tc_delta.id or "", "name": "", "arguments": ""}
+                        if tc_delta.function and tc_delta.function.name:
+                            tool_calls_acc[idx]["name"] = tc_delta.function.name
+                            yield StreamEvent(type="tool_use_start", content=tc_delta.function.name)
+                    if tc_delta.id:
+                        tool_calls_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_acc[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+            finish = chunk.choices[0].finish_reason if chunk.choices else None
+            if finish:
+                break
+
+        for tc_data in tool_calls_acc.values():
+            try:
+                inp = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
+            except json.JSONDecodeError:
+                inp = {}
+            yield StreamEvent(
+                type="tool_use_end",
+                tool_call={"type": "tool_use", "id": tc_data["id"], "name": tc_data["name"], "input": inp},
+            )
+
+        stop = "tool_use" if tool_calls_acc else "end_turn"
+        yield StreamEvent(type="done", content=stop)
 
 
 # ─────────────────────────────────────────────────────────

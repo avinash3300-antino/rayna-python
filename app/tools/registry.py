@@ -380,7 +380,20 @@ class ToolRegistry:
         if not executor:
             return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
         try:
+            # Check Redis cache first
+            from app.cache.redis_cache import get_cached, set_cached
+
+            cached = await get_cached(name, inp)
+            if cached is not None:
+                logger.info("[ToolRegistry] Cache HIT for '%s'", name)
+                return cached
+
             result = await executor(inp, session_id)
+
+            # Cache the result (fire-and-forget)
+            import asyncio
+            asyncio.create_task(set_cached(name, inp, result))
+
             return result
         except Exception as e:
             logger.exception("[ToolRegistry] Tool '%s' failed", name)

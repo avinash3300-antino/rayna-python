@@ -1,7 +1,6 @@
 """
-Motor async repositories for all 3 MongoDB collections.
-Replaces Mongoose models: Conversation, Message, Conversion.
-Same collection names, same field names.
+SQLAlchemy async repositories for all 3 PostgreSQL tables.
+Replaces Motor/MongoDB repositories. Same class names and method signatures.
 """
 
 from __future__ import annotations
@@ -10,25 +9,26 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from motor.motor_asyncio import AsyncIOMotorDatabase
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.memory.database import get_session_factory
+from app.memory.database import is_db_connected as _is_db_connected
+from app.memory.models import Conversation, Conversion, Message
 
 logger = logging.getLogger(__name__)
 
-# Module-level db reference set during app lifespan
-_db: AsyncIOMotorDatabase | None = None
-
-
-def set_database(db: AsyncIOMotorDatabase | None) -> None:
-    global _db
-    _db = db
-
-
-def get_database() -> AsyncIOMotorDatabase | None:
-    return _db
-
 
 def is_db_connected() -> bool:
-    return _db is not None
+    """Re-export so callers don't need to change imports."""
+    return _is_db_connected()
+
+
+def _row_to_dict(row: Any) -> dict[str, Any]:
+    """Convert a SQLAlchemy ORM row to a plain dict."""
+    if hasattr(row, "__table__"):
+        return {c.key: getattr(row, c.key) for c in row.__table__.columns}
+    return dict(row._mapping) if hasattr(row, "_mapping") else {}
 
 
 # ─────────────────────────────────────────────────────────
@@ -37,80 +37,94 @@ def is_db_connected() -> bool:
 
 
 class ConversationRepository:
-    @staticmethod
-    def _col():  # type: ignore[no-untyped-def]
-        if _db is None:
-            return None
-        return _db["conversations"]
-
     @classmethod
     async def upsert(cls, session_id: str, title: str) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
         try:
-            now = datetime.now(timezone.utc)
-            await col.update_one(
-                {"session_id": session_id},
-                {
-                    "$setOnInsert": {
-                        "session_id": session_id,
-                        "title": title[:60],
-                        "created_at": now,
+            async with factory() as session:
+                now = datetime.now(timezone.utc)
+                stmt = pg_insert(Conversation).values(
+                    session_id=session_id,
+                    title=title[:60],
+                    message_count=1,
+                    created_at=now,
+                    updated_at=now,
+                ).on_conflict_do_update(
+                    index_elements=["session_id"],
+                    set_={
+                        "message_count": Conversation.message_count + 1,
+                        "updated_at": now,
                     },
-                    "$inc": {"message_count": 1},
-                    "$set": {"updated_at": now},
-                },
-                upsert=True,
-            )
+                )
+                await session.execute(stmt)
+                await session.commit()
         except Exception:
             logger.exception("[DB] Failed to upsert conversation")
 
     @classmethod
     async def increment_count(cls, session_id: str) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
         try:
-            await col.update_one(
-                {"session_id": session_id},
-                {"$inc": {"message_count": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}},
-            )
+            async with factory() as session:
+                stmt = (
+                    update(Conversation)
+                    .where(Conversation.session_id == session_id)
+                    .values(
+                        message_count=Conversation.message_count + 1,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
         except Exception:
             logger.exception("[DB] Failed to update conversation count")
 
     @classmethod
     async def get_by_session(cls, session_id: str) -> dict[str, Any] | None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return None
-        return await col.find_one({"session_id": session_id})
+        async with factory() as session:
+            stmt = select(Conversation).where(Conversation.session_id == session_id)
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
 
     @classmethod
     async def list_all(cls, limit: int = 20, page: int = 1) -> tuple[list[dict[str, Any]], int]:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return [], 0
-        skip = (page - 1) * limit
-        cursor = (
-            col.find(
-                {},
-                {"session_id": 1, "title": 1, "message_count": 1, "created_at": 1, "updated_at": 1},
+        offset = (page - 1) * limit
+        async with factory() as session:
+            stmt = (
+                select(Conversation)
+                .order_by(Conversation.updated_at.desc())
+                .offset(offset)
+                .limit(limit)
             )
-            .sort("updated_at", -1)
-            .skip(skip)
-            .limit(limit)
-        )
-        conversations = await cursor.to_list(length=limit)
-        total = await col.count_documents({})
-        return conversations, total
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+
+            count_stmt = select(func.count()).select_from(Conversation)
+            total = (await session.execute(count_stmt)).scalar() or 0
+
+        return [_row_to_dict(r) for r in rows], total
 
     @classmethod
     async def delete_by_session(cls, session_id: str) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
-        await col.delete_one({"session_id": session_id})
+        async with factory() as session:
+            await session.execute(
+                delete(Conversation).where(Conversation.session_id == session_id)
+            )
+            await session.commit()
 
 
 # ─────────────────────────────────────────────────────────
@@ -119,12 +133,6 @@ class ConversationRepository:
 
 
 class MessageRepository:
-    @staticmethod
-    def _col():  # type: ignore[no-untyped-def]
-        if _db is None:
-            return None
-        return _db["messages"]
-
     @classmethod
     async def save(
         cls,
@@ -133,19 +141,20 @@ class MessageRepository:
         content: str,
         tour_carousel: dict[str, Any] | None = None,
     ) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
         try:
-            await col.insert_one(
-                {
-                    "session_id": session_id,
-                    "role": role,
-                    "content": content,
-                    "tourCarousel": tour_carousel,
-                    "timestamp": datetime.now(timezone.utc),
-                }
-            )
+            async with factory() as session:
+                msg = Message(
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    tour_carousel=tour_carousel,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                session.add(msg)
+                await session.commit()
         except Exception:
             logger.exception("[DB] Failed to save %s message", role)
 
@@ -153,29 +162,46 @@ class MessageRepository:
     async def get_history(
         cls, session_id: str, limit: int = 50, page: int = 1
     ) -> tuple[list[dict[str, Any]], int]:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return [], 0
-        skip = (page - 1) * limit
-        cursor = (
-            col.find(
-                {"session_id": session_id},
-                {"role": 1, "content": 1, "tourCarousel": 1, "timestamp": 1},
+        offset = (page - 1) * limit
+        async with factory() as session:
+            stmt = (
+                select(Message)
+                .where(Message.session_id == session_id)
+                .order_by(Message.timestamp.asc())
+                .offset(offset)
+                .limit(limit)
             )
-            .sort("timestamp", 1)
-            .skip(skip)
-            .limit(limit)
-        )
-        messages = await cursor.to_list(length=limit)
-        total = await col.count_documents({"session_id": session_id})
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+
+            count_stmt = (
+                select(func.count())
+                .select_from(Message)
+                .where(Message.session_id == session_id)
+            )
+            total = (await session.execute(count_stmt)).scalar() or 0
+
+        # Map to match previous API field names
+        messages = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d["tourCarousel"] = d.pop("tour_carousel", None)
+            messages.append(d)
         return messages, total
 
     @classmethod
     async def delete_by_session(cls, session_id: str) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
-        await col.delete_many({"session_id": session_id})
+        async with factory() as session:
+            await session.execute(
+                delete(Message).where(Message.session_id == session_id)
+            )
+            await session.commit()
 
 
 # ─────────────────────────────────────────────────────────
@@ -184,12 +210,6 @@ class MessageRepository:
 
 
 class ConversionRepository:
-    @staticmethod
-    def _col():  # type: ignore[no-untyped-def]
-        if _db is None:
-            return None
-        return _db["conversions"]
-
     @classmethod
     async def save(
         cls,
@@ -200,55 +220,85 @@ class ConversionRepository:
         converted_amount: float,
         exchange_rate: float,
     ) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
         try:
-            await col.insert_one(
-                {
-                    "session_id": session_id,
-                    "amount": amount,
-                    "fromCurrency": from_currency.upper(),
-                    "toCurrency": to_currency.upper(),
-                    "convertedAmount": converted_amount,
-                    "exchangeRate": exchange_rate,
-                    "timestamp": datetime.now(timezone.utc),
-                }
-            )
+            async with factory() as session:
+                conv = Conversion(
+                    session_id=session_id,
+                    amount=amount,
+                    from_currency=from_currency.upper(),
+                    to_currency=to_currency.upper(),
+                    converted_amount=converted_amount,
+                    exchange_rate=exchange_rate,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                session.add(conv)
+                await session.commit()
         except Exception:
             logger.exception("[DB] Failed to save conversion")
 
     @classmethod
     async def get_by_session(cls, session_id: str) -> list[dict[str, Any]]:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return []
-        cursor = (
-            col.find(
-                {"session_id": session_id},
-                {
-                    "amount": 1, "fromCurrency": 1, "toCurrency": 1,
-                    "convertedAmount": 1, "exchangeRate": 1, "timestamp": 1,
-                },
+        async with factory() as session:
+            stmt = (
+                select(Conversion)
+                .where(Conversion.session_id == session_id)
+                .order_by(Conversion.timestamp.desc())
             )
-            .sort("timestamp", -1)
-        )
-        return await cursor.to_list(length=200)
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+
+        conversions = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d["fromCurrency"] = d.pop("from_currency", "")
+            d["toCurrency"] = d.pop("to_currency", "")
+            d["convertedAmount"] = d.pop("converted_amount", 0.0)
+            d["exchangeRate"] = d.pop("exchange_rate", 0.0)
+            conversions.append(d)
+        return conversions
 
     @classmethod
     async def list_all(cls, limit: int = 20, page: int = 1) -> tuple[list[dict[str, Any]], int]:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return [], 0
-        skip = (page - 1) * limit
-        cursor = col.find().sort("timestamp", -1).skip(skip).limit(limit)
-        conversions = await cursor.to_list(length=limit)
-        total = await col.count_documents({})
+        offset = (page - 1) * limit
+        async with factory() as session:
+            stmt = (
+                select(Conversion)
+                .order_by(Conversion.timestamp.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+
+            count_stmt = select(func.count()).select_from(Conversion)
+            total = (await session.execute(count_stmt)).scalar() or 0
+
+        conversions = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d["fromCurrency"] = d.pop("from_currency", "")
+            d["toCurrency"] = d.pop("to_currency", "")
+            d["convertedAmount"] = d.pop("converted_amount", 0.0)
+            d["exchangeRate"] = d.pop("exchange_rate", 0.0)
+            conversions.append(d)
         return conversions, total
 
     @classmethod
     async def delete_by_session(cls, session_id: str) -> None:
-        col = cls._col()
-        if col is None:
+        factory = get_session_factory()
+        if factory is None:
             return
-        await col.delete_many({"session_id": session_id})
+        async with factory() as session:
+            await session.execute(
+                delete(Conversion).where(Conversion.session_id == session_id)
+            )
+            await session.commit()

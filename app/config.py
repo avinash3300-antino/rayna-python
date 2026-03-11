@@ -53,8 +53,8 @@ class Settings(BaseSettings):
     rate_limit_window_ms: int = Field(default=60000, alias="RATE_LIMIT_WINDOW_MS")
     rate_limit_max_requests: int = Field(default=20, alias="RATE_LIMIT_MAX_REQUESTS")
 
-    # MongoDB
-    mongodb_uri: str = Field(default="", alias="MONGODB_URI")
+    # PostgreSQL
+    database_url: str = Field(default="", alias="DATABASE_URL")
 
     # RAG
     rag_enabled: bool = Field(default=True, alias="RAG_ENABLED")

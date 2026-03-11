@@ -16,7 +16,7 @@ BASE_URL = "https://earnest-panda-e8edbd.netlify.app/api"
 
 class VisaService:
     def __init__(self) -> None:
-        self._http = httpx.AsyncClient(timeout=10.0, headers={
+        self._http = httpx.AsyncClient(timeout=30.0, headers={
             "Accept": "application/json",
             "User-Agent": "Rayna-Tours-Chatbot/2.0.0",
         })

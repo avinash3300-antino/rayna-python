@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from langgraph.graph import END, StateGraph
 
@@ -94,6 +94,25 @@ def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
 
 def _extract_product_cards(data: dict[str, Any], carousel_type: str) -> list[dict[str, Any]]:
     """Extract product cards from raw API response for holidays, cruises, yachts."""
+    # Deep debug logging for structure discovery
+    def _log_structure(obj: Any, prefix: str = "", depth: int = 0) -> None:
+        if depth > 3:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, list):
+                    sample = type(v[0]).__name__ if v else "empty"
+                    logger.info("[CardExtract] %s%s: list[%d] of %s", prefix, k, len(v), sample)
+                    if v and isinstance(v[0], dict):
+                        logger.info("[CardExtract] %s%s[0] keys: %s", prefix, k, list(v[0].keys())[:8])
+                elif isinstance(v, dict):
+                    logger.info("[CardExtract] %s%s: dict keys=%s", prefix, k, list(v.keys())[:8])
+                    _log_structure(v, prefix=f"{prefix}{k}.", depth=depth + 1)
+                else:
+                    logger.info("[CardExtract] %s%s: %s = %s", prefix, k, type(v).__name__, str(v)[:80])
+
+    _log_structure(data)
+
     products = _find_product_list(data)
 
     logger.info(
@@ -363,7 +382,7 @@ async def execute_tools(state: AgentState) -> AgentState:
 
 
 async def save_turn(state: AgentState) -> AgentState:
-    """Persist message to MongoDB + update in-memory session."""
+    """Persist message to PostgreSQL + update in-memory session."""
     assert _session_service is not None
     session_id = state.get("session_id", "")
     final_reply = _sanitize_reply(state.get("final_reply", ""))
@@ -372,14 +391,11 @@ async def save_turn(state: AgentState) -> AgentState:
 
     _session_service.add_message(session_id, {"role": "assistant", "content": final_reply})
 
+    # Fire-and-forget DB save — don't block the response
     if is_db_connected():
-        await MessageRepository.save(
-            session_id=session_id,
-            role="assistant",
-            content=final_reply,
-            tour_carousel=product_carousel or tour_carousel,
+        asyncio.create_task(
+            _save_assistant_message(session_id, final_reply, product_carousel or tour_carousel)
         )
-        await ConversationRepository.increment_count(session_id)
 
     return state
 
@@ -464,10 +480,9 @@ async def run_agent(
     # 1. Save user message to in-memory session
     _session_service.add_message(session_id, {"role": "user", "content": user_message}, user_id)
 
-    # 1b. Persist user message + upsert conversation to MongoDB
+    # 1b. Persist user message + upsert conversation to PostgreSQL (fire-and-forget)
     if is_db_connected():
-        await ConversationRepository.upsert(session_id, user_message)
-        await MessageRepository.save(session_id=session_id, role="user", content=user_message)
+        asyncio.create_task(_save_user_message(session_id, user_message))
 
     # 2. Get context (last N messages)
     messages = _session_service.get_context(session_id)
@@ -500,4 +515,221 @@ async def run_agent(
         "tourCarousel": final_state.get("tour_carousel"),
         "productCarousel": final_state.get("product_carousel"),
         "metadata": final_state.get("metadata"),
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Fire-and-forget DB helpers
+# ─────────────────────────────────────────────────────────
+
+
+async def _save_user_message(session_id: str, user_message: str) -> None:
+    """Persist user message to DB without blocking the response."""
+    try:
+        await ConversationRepository.upsert(session_id, user_message)
+        await MessageRepository.save(session_id=session_id, role="user", content=user_message)
+    except Exception:
+        logger.exception("[DB] Background save of user message failed")
+
+
+async def _save_assistant_message(
+    session_id: str, reply: str, carousel: dict[str, Any] | None
+) -> None:
+    """Persist assistant message to DB without blocking the response."""
+    try:
+        await MessageRepository.save(
+            session_id=session_id, role="assistant", content=reply, tour_carousel=carousel
+        )
+        await ConversationRepository.increment_count(session_id)
+    except Exception:
+        logger.exception("[DB] Background save of assistant message failed")
+
+
+# ─────────────────────────────────────────────────────────
+# Streaming Agent Loop — yields SSE events in real-time
+# ─────────────────────────────────────────────────────────
+
+
+async def run_agent_streaming(
+    session_id: str, user_message: str, user_id: str | None = None
+) -> AsyncGenerator[dict[str, Any], None]:
+    """
+    Streaming entry point — yields SSE event dicts as the agent works.
+    Event types: status, token, carousel, done, error
+    """
+    assert _session_service is not None
+    assert _llm is not None
+    assert _rag is not None
+
+    from app.agent.provider import StreamEvent
+
+    # 1. Save user message (fire-and-forget)
+    _session_service.add_message(session_id, {"role": "user", "content": user_message}, user_id)
+    if is_db_connected():
+        asyncio.create_task(_save_user_message(session_id, user_message))
+
+    # 2. RAG enrichment
+    yield {"type": "status", "message": "Thinking..."}
+    messages = _session_service.get_context(session_id)
+
+    user_query = user_message
+    enhanced_prompt = await _rag.get_enhanced_system_prompt(SYSTEM_PROMPT, user_query)
+
+    tools = ToolRegistry.get_all_schemas()
+    tour_carousel: dict[str, Any] | None = None
+    product_carousel: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    full_text_parts: list[str] = []
+
+    # Tool name → friendly status message
+    TOOL_STATUS = {
+        "get_tour_cards": "Searching for tours...",
+        "get_available_cities": "Looking up destinations...",
+        "get_all_products": "Fetching products...",
+        "get_city_products": "Fetching city products...",
+        "get_city_holiday_packages": "Finding holiday packages...",
+        "get_city_cruises": "Searching for cruises...",
+        "get_city_yachts": "Finding yacht experiences...",
+        "get_product_details": "Getting product details...",
+        "get_visas": "Looking up visa information...",
+        "get_popular_visas": "Fetching popular visas...",
+        "convert_currency": "Converting currency...",
+    }
+
+    PRODUCT_CARD_TOOLS = {
+        "get_city_holiday_packages": "holiday_carousel",
+        "get_city_cruises": "cruise_carousel",
+        "get_city_yachts": "yacht_carousel",
+    }
+
+    for iteration in range(MAX_ITERATIONS):
+        logger.info("[StreamAgent] Iteration %d", iteration + 1)
+
+        # Collect all stream events for this LLM call
+        text_chunks: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        stop_reason = "end_turn"
+        is_final_response = True  # assume final until we see tool_use
+
+        async for event in _llm.stream_chat(messages, enhanced_prompt, tools):
+            if event.type == "token":
+                text_chunks.append(event.content)
+                # Only stream tokens if this might be the final response
+                # We'll buffer and check — if tools come later, we won't re-send
+                yield {"type": "token", "content": event.content}
+            elif event.type == "tool_use_start":
+                is_final_response = False
+                yield {"type": "status", "message": TOOL_STATUS.get(event.content, f"Running {event.content}...")}
+            elif event.type == "tool_use_end" and event.tool_call:
+                tool_calls.append(event.tool_call)
+            elif event.type == "done":
+                stop_reason = event.content
+
+        # Build raw_content for message history
+        raw_content: list[dict[str, Any]] = []
+        full_text = "".join(text_chunks)
+        if full_text:
+            raw_content.append({"type": "text", "text": full_text})
+        for tc in tool_calls:
+            raw_content.append(tc)
+
+        messages = messages + [{"role": "assistant", "content": raw_content}]
+
+        # If no tool calls — we're done
+        if not tool_calls:
+            full_text_parts.append(full_text)
+            break
+
+        # If we streamed tokens before tool calls, tell frontend to clear them
+        if text_chunks:
+            yield {"type": "clear_tokens"}
+
+        # Execute tools in parallel
+        async def _run_tool(call: dict[str, Any]) -> dict[str, str]:
+            nonlocal tour_carousel, product_carousel, metadata
+            result = await ToolRegistry.execute(call["name"], call["input"], session_id)
+
+            # Capture tour carousel
+            if call["name"] == "get_tour_cards" and result:
+                try:
+                    parsed = json.loads(result) if isinstance(result, str) else result
+                    if parsed.get("success") and parsed.get("data", {}).get("carousel"):
+                        tour_carousel = parsed["data"]["carousel"]
+                        product_carousel = tour_carousel
+                        metadata = {
+                            "hasCards": True,
+                            "cardType": "tour_carousel",
+                            "cardCount": len(parsed["data"]["carousel"].get("cards", [])),
+                            "totalResults": parsed["data"].get("totalResults", 0),
+                        }
+                except Exception:
+                    logger.exception("[StreamAgent] Error parsing tour cards")
+
+            # Capture holiday/cruise/yacht carousel
+            elif call["name"] in PRODUCT_CARD_TOOLS and result:
+                try:
+                    parsed = json.loads(result) if isinstance(result, str) else result
+                    if parsed.get("success") and parsed.get("data"):
+                        carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
+                        cards = _extract_product_cards(parsed["data"], carousel_type)
+                        if cards:
+                            product_carousel = {
+                                "type": carousel_type,
+                                "title": _carousel_title(carousel_type, call["input"]),
+                                "cards": cards,
+                                "totalResults": len(cards),
+                            }
+                            metadata = {
+                                "hasCards": True,
+                                "cardType": carousel_type,
+                                "cardCount": len(cards),
+                                "totalResults": len(cards),
+                            }
+                except Exception:
+                    logger.exception("[StreamAgent] Error parsing %s", call["name"])
+
+            return {"id": call["id"], "content": result if isinstance(result, str) else json.dumps(result)}
+
+        results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
+
+        # Add tool results to messages
+        tool_result_message = _llm.build_tool_result_message(list(results))
+        messages = messages + [tool_result_message]
+
+        yield {"type": "status", "message": "Generating response..."}
+
+    else:
+        # Max iterations reached
+        full_text_parts.append(
+            "I'm having trouble processing that right now. "
+            "Please try again or visit raynatours.com for assistance."
+        )
+        yield {"type": "token", "content": full_text_parts[-1]}
+
+    # Sanitize final reply
+    final_reply = _sanitize_reply("".join(full_text_parts))
+
+    # Save to in-memory session
+    _session_service.add_message(session_id, {"role": "assistant", "content": final_reply})
+
+    # Fire-and-forget DB save
+    if is_db_connected():
+        asyncio.create_task(
+            _save_assistant_message(session_id, final_reply, product_carousel or tour_carousel)
+        )
+
+    # Send carousel data if present
+    if tour_carousel or product_carousel:
+        yield {
+            "type": "carousel",
+            "tourCarousel": tour_carousel,
+            "productCarousel": product_carousel,
+            "metadata": metadata,
+        }
+
+    # Done event
+    yield {
+        "type": "done",
+        "session_id": session_id,
+        "metadata": metadata,
     }

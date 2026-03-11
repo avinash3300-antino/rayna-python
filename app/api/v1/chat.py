@@ -1,5 +1,6 @@
 """
-POST /api/chat — replaces src/chat/chat.router.ts.
+POST /api/chat         — standard JSON response (kept for backward compat)
+POST /api/chat/stream  — SSE streaming response (fast, real-time tokens)
 GET  /api/chat/history/:sessionId
 DELETE /api/chat/session/:sessionId
 GET  /api/chat/health
@@ -7,15 +8,20 @@ GET  /api/chat/health
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse
 
-from app.agent.graph import run_agent
+from app.agent.graph import run_agent, run_agent_streaming
 from app.memory.session import SessionService
 from app.models.schemas import ChatRequest, ChatResponse, ErrorResponse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -30,7 +36,7 @@ def set_session_service(svc: SessionService) -> None:
 
 @router.post("/", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> JSONResponse:
-    """Main chat endpoint — rate limited via slowapi."""
+    """Standard chat endpoint — returns full response as JSON."""
     session_id = body.session_id or str(uuid.uuid4())
 
     try:
@@ -46,12 +52,44 @@ async def chat(request: Request, body: ChatRequest) -> JSONResponse:
             },
         )
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).exception("[ChatRouter] Chat error")
+        logger.exception("[ChatRouter] Chat error")
         return JSONResponse(
             status_code=500,
             content={"error": "Something went wrong. Please try again.", "details": str(e)},
         )
+
+
+@router.post("/stream")
+async def chat_stream(request: Request, body: ChatRequest) -> EventSourceResponse:
+    """
+    SSE streaming chat endpoint — sends tokens in real-time.
+
+    Event types sent to client:
+      event: status   → {"type":"status","message":"Searching for tours..."}
+      event: token    → {"type":"token","content":"Here are"}
+      event: clear    → {"type":"clear_tokens"}  (discard buffered tokens before tool loop)
+      event: carousel → {"type":"carousel","tourCarousel":{...},"productCarousel":{...}}
+      event: done     → {"type":"done","session_id":"..."}
+      event: error    → {"type":"error","message":"..."}
+    """
+    session_id = body.session_id or str(uuid.uuid4())
+
+    async def event_generator():
+        try:
+            async for event in run_agent_streaming(session_id, body.message):
+                event_type = event.get("type", "status")
+                yield {
+                    "event": event_type,
+                    "data": json.dumps(event),
+                }
+        except Exception as e:
+            logger.exception("[ChatRouter] Stream error")
+            yield {
+                "event": "error",
+                "data": json.dumps({"type": "error", "message": str(e)}),
+            }
+
+    return EventSourceResponse(event_generator())
 
 
 @router.get("/history/{session_id}")

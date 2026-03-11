@@ -13,7 +13,6 @@ import math
 from datetime import datetime
 from typing import Any
 
-from bson import ObjectId
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
@@ -28,19 +27,19 @@ router = APIRouter(prefix="/api/history", tags=["history"])
 
 
 def _serialize_doc(doc: dict[str, Any]) -> dict[str, Any]:
-    """Make a MongoDB document JSON-safe (ObjectId, datetime, etc.)."""
+    """Make a PostgreSQL row dict JSON-safe (datetime → isoformat)."""
     for key, value in doc.items():
-        if isinstance(value, ObjectId):
-            doc[key] = str(value)
-        elif isinstance(value, datetime):
+        if isinstance(value, datetime):
             doc[key] = value.isoformat()
         elif isinstance(value, dict):
             doc[key] = _serialize_doc(value)
         elif isinstance(value, list):
-            doc[key] = [_serialize_doc(v) if isinstance(v, dict) else
-                        v.isoformat() if isinstance(v, datetime) else
-                        str(v) if isinstance(v, ObjectId) else v
-                        for v in value]
+            doc[key] = [
+                _serialize_doc(v) if isinstance(v, dict)
+                else v.isoformat() if isinstance(v, datetime)
+                else v
+                for v in value
+            ]
     return doc
 
 
@@ -48,7 +47,7 @@ def _require_db() -> JSONResponse | None:
     if not is_db_connected():
         return JSONResponse(
             status_code=503,
-            content={"error": "Database not connected. Configure MONGODB_URI to enable history."},
+            content={"error": "Database not connected. Configure DATABASE_URL to enable history."},
         )
     return None
 

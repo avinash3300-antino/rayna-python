@@ -1,6 +1,6 @@
 """
-Pydantic v2 models — replaces Mongoose schemas + Zod DTOs.
-Same collection names, same field names, same behavior.
+Pydantic v2 models — API DTOs and validation schemas.
+Database tables are defined in app/memory/models.py (SQLAlchemy ORM).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 # ─────────────────────────────────────────────────────────
-# MongoDB Document Shapes (used by Motor repositories)
+# Database Document Shapes (validation / serialization)
 # ─────────────────────────────────────────────────────────
 
 

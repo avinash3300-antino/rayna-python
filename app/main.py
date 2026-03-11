@@ -1,6 +1,6 @@
 """
 FastAPI entrypoint — replaces api/index.ts + src/main.ts.
-Lifespan event connects Motor to MongoDB (replaces Vercel cold-start singleton).
+Lifespan event connects to PostgreSQL (replaces MongoDB/Motor).
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from slowapi.errors import RateLimitExceeded
 from app.api.v1 import chat as chat_router
 from app.api.v1 import history as history_router
 from app.api.v1 import rag as rag_router
+from app.cache.redis_cache import close_redis, init_redis
 from app.config import get_settings
-from app.memory.repositories import set_database
+from app.memory.database import close_db, init_db
 from app.memory.session import SessionService
 from app.middleware.rate_limit import create_limiter
 
@@ -45,33 +46,22 @@ session_service = SessionService()
 limiter = create_limiter()
 
 
-# ── Lifespan: connect/disconnect MongoDB, start/stop cleanup ─
+# ── Lifespan: connect/disconnect PostgreSQL, start/stop cleanup ─
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
 
-    # Connect to MongoDB via Motor
-    db = None
-    if settings.mongodb_uri and "<username>" not in settings.mongodb_uri:
+    # Connect to PostgreSQL via SQLAlchemy async
+    if settings.database_url:
         try:
-            from motor.motor_asyncio import AsyncIOMotorClient
-
-            client = AsyncIOMotorClient(
-                settings.mongodb_uri,
-                serverSelectionTimeoutMS=5000,
-            )
-            # Ping to verify connection
-            await client.admin.command("ping")
-            db = client.get_default_database()
-            if db is None:
-                # Extract DB name from URI or default to "rayna"
-                db = client["rayna"]
-            set_database(db)
-            logger.info("[DB] Connected to MongoDB")
+            await init_db(settings.database_url)
         except Exception:
-            logger.exception("[DB] Connection failed — history will not be persisted")
+            logger.exception("[DB] PostgreSQL connection failed — history will not be persisted")
     else:
-        logger.warning("[DB] MONGODB_URI not configured — history will not be persisted.")
+        logger.warning("[DB] DATABASE_URL not configured — history will not be persisted.")
+
+    # Connect to Redis for caching
+    await init_redis()
 
     # Start session TTL cleanup
     session_service.start_cleanup_loop()
@@ -108,7 +98,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Cleanup
     await session_service.stop_cleanup_loop()
-    set_database(None)
+    await close_redis()
+    await close_db()
     logger.info("[App] Shutdown complete")
 
 
@@ -148,6 +139,7 @@ async def root() -> JSONResponse:
             "status": "running",
             "endpoints": {
                 "chat": "POST   /api/chat",
+                "chatStream": "POST   /api/chat/stream  (SSE)",
                 "clear": "DELETE /api/chat/session/{sessionId}",
                 "health": "GET    /api/chat/health",
                 "ragStatus": "GET    /api/rag/status",
