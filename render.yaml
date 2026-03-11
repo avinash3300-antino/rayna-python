@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: rayna-chatbot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: "3001"
+      - key: NODE_ENV
+        value: "production"
+      - key: LLM_PROVIDER
+        sync: false        # set manually in Render dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false        # Neon PostgreSQL connection string
+      - key: REDIS_URL
+        sync: false        # Upstash Redis connection string
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: RAG_ENABLED
+        value: "true"
+      - key: PINECONE_INDEX_NAME
+        value: "raynatour-openai"

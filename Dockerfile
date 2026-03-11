@@ -28,6 +28,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY app/ ./app/
+RUN mkdir -p ./data
 COPY data/ ./data/
 
 # Non-root user
@@ -35,11 +36,8 @@ RUN adduser --disabled-password --gecos '' appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-EXPOSE 3001
+ENV PORT=3001
+EXPOSE ${PORT}
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:3001/health').raise_for_status()"
-
-# Run with uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3001", "--workers", "1"]
+# Run with uvicorn — uses PORT env var so Render/Railway can override it
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1
