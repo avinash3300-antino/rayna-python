@@ -35,6 +35,12 @@ from app.memory.repositories import (
 from app.memory.session import SessionService
 from app.prompts.system import SYSTEM_PROMPT
 from app.rag.pipeline import RAGService
+from app.tools.product_database import (
+    get_cruises_by_city,
+    get_holidays_by_city,
+    get_yachts_by_city,
+    static_product_to_card,
+)
 from app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -43,11 +49,25 @@ MAX_ITERATIONS = 5
 
 
 def _is_product_item(item: dict[str, Any]) -> bool:
-    """Check if a dict looks like a real product (has name + price or url)."""
-    has_name = bool(item.get("name") or item.get("title"))
-    has_price = any(item.get(k) for k in ("normalPrice", "salePrice", "price", "currentPrice", "originalPrice"))
-    has_url = bool(item.get("url") or item.get("productUrl"))
-    # Must have a name AND at least price or url to be a real product
+    """Check if a dict looks like a real product.
+
+    Handles multiple API response formats:
+      - Standard: name/title + price/url
+      - Rayna holiday API: packageName + priceCents + productLink
+    """
+    has_name = bool(
+        item.get("name") or item.get("title") or item.get("packageName")
+    )
+    has_price = any(
+        item.get(k)
+        for k in (
+            "normalPrice", "salePrice", "price", "currentPrice",
+            "originalPrice", "priceCents", "discountedPrice",
+        )
+    )
+    has_url = bool(
+        item.get("url") or item.get("productUrl") or item.get("productLink")
+    )
     return has_name and (has_price or has_url)
 
 
@@ -56,11 +76,9 @@ def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
     if depth > 6:
         return []
 
-    # If it's already a list of dicts that look like real products, return it
     if isinstance(data, list) and data:
         if isinstance(data[0], dict) and _is_product_item(data[0]):
             return data
-        # Search within list items
         for item in data:
             if isinstance(item, dict):
                 result = _find_product_list(item, depth + 1)
@@ -69,12 +87,12 @@ def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
         return []
 
     if isinstance(data, dict):
-        # Check known keys for product lists first (prioritize "products" key)
+        # Check known keys first
         for key in ("products", "packages", "holidays", "cruises", "yachts", "items", "results"):
             val = data.get(key)
             if isinstance(val, list) and val and isinstance(val[0], dict) and _is_product_item(val[0]):
                 return val
-        # Recurse into dict values (check "data" key last to avoid matching sub-objects)
+        # Recurse into "data" key
         for key in ("data",):
             val = data.get(key)
             if isinstance(val, (dict, list)):
@@ -84,7 +102,7 @@ def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
         # Recurse into other dict values
         for k, val in data.items():
             if k in ("products", "packages", "holidays", "cruises", "yachts", "items", "results", "data"):
-                continue  # Already checked above
+                continue
             if isinstance(val, (dict, list)):
                 result = _find_product_list(val, depth + 1)
                 if result:
@@ -92,27 +110,38 @@ def _find_product_list(data: Any, depth: int = 0) -> list[dict[str, Any]]:
     return []
 
 
+def _extract_image(p: dict[str, Any]) -> str:
+    """Extract image URL from various API response formats."""
+    # Flat fields
+    img = p.get("image") or p.get("imageUrl") or p.get("thumbnail") or ""
+    if img:
+        return img
+    # Rayna holiday format: imageProps[0].image.src
+    image_props = p.get("imageProps")
+    if isinstance(image_props, list) and image_props:
+        first = image_props[0]
+        if isinstance(first, dict):
+            inner = first.get("image", {})
+            if isinstance(inner, dict):
+                return inner.get("src", "")
+    return ""
+
+
+def _extract_url(p: dict[str, Any]) -> str:
+    """Extract product URL from various API response formats."""
+    url = p.get("url") or p.get("productUrl") or ""
+    if url:
+        return url if url.startswith("http") else f"https://www.raynatours.com{url}"
+    # Rayna holiday format: productLink.href
+    link = p.get("productLink")
+    if isinstance(link, dict):
+        href = link.get("href", "")
+        return f"https://www.raynatours.com{href}" if href else ""
+    return ""
+
+
 def _extract_product_cards(data: dict[str, Any], carousel_type: str) -> list[dict[str, Any]]:
     """Extract product cards from raw API response for holidays, cruises, yachts."""
-    # Deep debug logging for structure discovery
-    def _log_structure(obj: Any, prefix: str = "", depth: int = 0) -> None:
-        if depth > 3:
-            return
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, list):
-                    sample = type(v[0]).__name__ if v else "empty"
-                    logger.info("[CardExtract] %s%s: list[%d] of %s", prefix, k, len(v), sample)
-                    if v and isinstance(v[0], dict):
-                        logger.info("[CardExtract] %s%s[0] keys: %s", prefix, k, list(v[0].keys())[:8])
-                elif isinstance(v, dict):
-                    logger.info("[CardExtract] %s%s: dict keys=%s", prefix, k, list(v.keys())[:8])
-                    _log_structure(v, prefix=f"{prefix}{k}.", depth=depth + 1)
-                else:
-                    logger.info("[CardExtract] %s%s: %s = %s", prefix, k, type(v).__name__, str(v)[:80])
-
-    _log_structure(data)
-
     products = _find_product_list(data)
 
     logger.info(
@@ -127,24 +156,51 @@ def _extract_product_cards(data: dict[str, Any], carousel_type: str) -> list[dic
     for p in products[:12]:
         if not isinstance(p, dict):
             continue
-        card = {
+
+        # Extract title (multiple field name conventions)
+        title = p.get("name") or p.get("title") or p.get("packageName") or ""
+
+        # Extract prices (multiple field name conventions)
+        original_price = _safe_float(
+            p.get("normalPrice") or p.get("originalPrice") or p.get("price") or p.get("priceCents")
+        )
+        current_price = _safe_float(
+            p.get("salePrice") or p.get("currentPrice") or p.get("discountedPrice")
+            or p.get("price") or p.get("priceCents") or p.get("normalPrice")
+        )
+
+        # Extract duration
+        duration = p.get("duration") or p.get("noOfDays") or p.get("noOfNights") or ""
+
+        # Extract rating
+        rating = _safe_float(p.get("averageRating") or p.get("rating") or 0)
+
+        card: dict[str, Any] = {
             "id": p.get("id") or p.get("productId") or p.get("slug", ""),
-            "title": p.get("name") or p.get("title") or "",
-            "image": p.get("image") or p.get("imageUrl") or p.get("thumbnail") or "",
+            "title": title,
+            "image": _extract_image(p),
             "location": p.get("city") or p.get("location") or p.get("cityName") or "",
-            "category": p.get("category") or p.get("productCategory") or p.get("type") or carousel_type.replace("_carousel", ""),
-            "originalPrice": _safe_float(p.get("normalPrice") or p.get("originalPrice") or p.get("price")),
-            "currentPrice": _safe_float(p.get("salePrice") or p.get("currentPrice") or p.get("price") or p.get("normalPrice")),
+            "category": p.get("category") or p.get("variant") or p.get("productCategory") or p.get("type") or carousel_type.replace("_carousel", ""),
+            "originalPrice": original_price,
+            "currentPrice": current_price,
             "currency": p.get("currency") or "AED",
-            "duration": p.get("duration") or p.get("noOfDays") or "",
-            "url": p.get("url") or p.get("productUrl") or "",
-            "slug": p.get("slug") or p.get("url") or "",
+            "duration": duration,
+            "url": _extract_url(p),
+            "slug": p.get("slug") or "",
         }
-        # Include amenities/inclusions for holidays
+        if rating:
+            card["rating"] = rating
+            card["reviewCount"] = p.get("reviewCount") or 0
+
+        # Include amenities for holidays (extract names from objects)
         if carousel_type == "holiday_carousel":
-            card["amenities"] = p.get("amenities") or p.get("inclusions") or []
-        # Accept card if it has a title (don't filter on price — some may be 0 / free)
-        if card["title"]:
+            raw_amenities = p.get("amenities") or p.get("inclusions") or []
+            if raw_amenities and isinstance(raw_amenities[0], dict):
+                card["amenities"] = [a.get("name", "") for a in raw_amenities if a.get("name")]
+            else:
+                card["amenities"] = raw_amenities
+
+        if title:
             cards.append(card)
 
     logger.info("[CardExtract] Built %d cards from %d products", len(cards), len(products))
@@ -170,6 +226,96 @@ def _carousel_title(carousel_type: str, inp: dict[str, Any]) -> str:
     }
     label = labels.get(carousel_type, "Experiences")
     return f"🌟 {label}"
+
+
+def _get_fallback_cards(carousel_type: str, city: str | None) -> list[dict[str, Any]]:
+    """Get static fallback cards when the API returns no products."""
+    city = city or "Dubai"
+    lookup = {
+        "holiday_carousel": get_holidays_by_city,
+        "cruise_carousel": get_cruises_by_city,
+        "yacht_carousel": get_yachts_by_city,
+    }
+    getter = lookup.get(carousel_type)
+    if not getter:
+        return []
+    products = getter(city)
+    return [static_product_to_card(p, carousel_type) for p in products]
+
+
+def _generate_suggestions(
+    user_message: str, reply: str, metadata: dict[str, Any] | None
+) -> list[str]:
+    """Generate 2-3 contextual follow-up suggestions based on the conversation."""
+    msg = user_message.lower()
+    suggestions: list[str] = []
+
+    # Detect destination from user message
+    destinations = [
+        "dubai", "abu dhabi", "singapore", "thailand", "bangkok", "phuket",
+        "bali", "turkey", "istanbul", "maldives", "malaysia", "georgia",
+        "oman", "kerala", "munnar", "goa", "delhi", "jaipur", "rajasthan",
+        "india", "muscat", "riyadh", "jeddah",
+    ]
+    detected_city = ""
+    for dest in destinations:
+        if dest in msg or dest in reply.lower():
+            detected_city = dest.title()
+            break
+
+    # Based on what was shown/discussed
+    card_type = (metadata or {}).get("cardType", "")
+
+    if card_type == "tour_carousel" and detected_city:
+        suggestions = [
+            f"{detected_city} holiday packages",
+            f"Cruises in {detected_city}",
+            f"What are the best activities in {detected_city}?",
+        ]
+    elif card_type == "holiday_carousel" and detected_city:
+        suggestions = [
+            f"Tours in {detected_city}",
+            f"Cruises in {detected_city}",
+            f"Show me {detected_city} visa info",
+        ]
+    elif card_type == "cruise_carousel" and detected_city:
+        suggestions = [
+            f"Yacht experiences in {detected_city}",
+            f"{detected_city} tours",
+            f"{detected_city} holiday packages",
+        ]
+    elif card_type == "yacht_carousel" and detected_city:
+        suggestions = [
+            f"Cruises in {detected_city}",
+            f"{detected_city} holiday packages",
+            f"Tours in {detected_city}",
+        ]
+    elif detected_city:
+        suggestions = [
+            f"Tours in {detected_city}",
+            f"{detected_city} holiday packages",
+            f"Things to do in {detected_city}",
+        ]
+    elif any(w in msg for w in ("visa", "passport", "travel document")):
+        suggestions = [
+            "Popular visa destinations",
+            "Dubai tours",
+            "Thailand holiday packages",
+        ]
+    elif any(w in msg for w in ("hi", "hello", "hey", "start")):
+        suggestions = [
+            "Show me Dubai tours",
+            "Thailand holiday packages",
+            "Singapore attractions",
+        ]
+    else:
+        suggestions = [
+            "Dubai tours",
+            "Holiday packages",
+            "Popular destinations",
+        ]
+
+    return suggestions[:3]
 
 
 def _sanitize_reply(text: str) -> str:
@@ -336,6 +482,8 @@ async def execute_tools(state: AgentState) -> AgentState:
         elif call["name"] in PRODUCT_CARD_TOOLS and result:
             try:
                 parsed = json.loads(result) if isinstance(result, str) else result
+                carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
+                city_hint = call["input"].get("city") or call["input"].get("cityName") or call["input"].get("destination")
                 logger.info(
                     "[AgentLoop] %s raw result keys: %s, success=%s, has_data=%s",
                     call["name"],
@@ -343,23 +491,30 @@ async def execute_tools(state: AgentState) -> AgentState:
                     parsed.get("success"),
                     bool(parsed.get("data")),
                 )
+
+                cards: list[dict[str, Any]] = []
                 if parsed.get("success") and parsed.get("data"):
-                    carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
                     cards = _extract_product_cards(parsed["data"], carousel_type)
-                    if cards:
-                        product_carousel = {
-                            "type": carousel_type,
-                            "title": _carousel_title(carousel_type, call["input"]),
-                            "cards": cards,
-                            "totalResults": len(cards),
-                        }
-                        metadata = {
-                            "hasCards": True,
-                            "cardType": carousel_type,
-                            "cardCount": len(cards),
-                            "totalResults": len(cards),
-                        }
-                        logger.info("[AgentLoop] %s cards retrieved: %d cards", carousel_type, len(cards))
+
+                # Fallback to static database if API returned no usable cards
+                if not cards:
+                    logger.info("[AgentLoop] No API cards for %s, using static fallback (city=%s)", carousel_type, city_hint)
+                    cards = _get_fallback_cards(carousel_type, city_hint)
+
+                if cards:
+                    product_carousel = {
+                        "type": carousel_type,
+                        "title": _carousel_title(carousel_type, call["input"]),
+                        "cards": cards,
+                        "totalResults": len(cards),
+                    }
+                    metadata = {
+                        "hasCards": True,
+                        "cardType": carousel_type,
+                        "cardCount": len(cards),
+                        "totalResults": len(cards),
+                    }
+                    logger.info("[AgentLoop] %s cards retrieved: %d cards", carousel_type, len(cards))
             except Exception:
                 logger.exception("[AgentLoop] Error parsing %s result", call["name"])
 
@@ -611,14 +766,17 @@ async def run_agent_streaming(
         stop_reason = "end_turn"
         is_final_response = True  # assume final until we see tool_use
 
+        # Buffer tokens — only stream to frontend if this is the final response (no tool calls)
+        buffered_tokens: list[str] = []
+
         async for event in _llm.stream_chat(messages, enhanced_prompt, tools):
             if event.type == "token":
                 text_chunks.append(event.content)
-                # Only stream tokens if this might be the final response
-                # We'll buffer and check — if tools come later, we won't re-send
-                yield {"type": "token", "content": event.content}
+                if is_final_response:
+                    buffered_tokens.append(event.content)
             elif event.type == "tool_use_start":
                 is_final_response = False
+                buffered_tokens.clear()  # Discard any pre-tool text
                 yield {"type": "status", "message": TOOL_STATUS.get(event.content, f"Running {event.content}...")}
             elif event.type == "tool_use_end" and event.tool_call:
                 tool_calls.append(event.tool_call)
@@ -635,14 +793,12 @@ async def run_agent_streaming(
 
         messages = messages + [{"role": "assistant", "content": raw_content}]
 
-        # If no tool calls — we're done
+        # If no tool calls — this is the final response, send full text at once
         if not tool_calls:
+            if full_text:
+                yield {"type": "token", "content": full_text}
             full_text_parts.append(full_text)
             break
-
-        # If we streamed tokens before tool calls, tell frontend to clear them
-        if text_chunks:
-            yield {"type": "clear_tokens"}
 
         # Execute tools in parallel
         async def _run_tool(call: dict[str, Any]) -> dict[str, str]:
@@ -669,22 +825,31 @@ async def run_agent_streaming(
             elif call["name"] in PRODUCT_CARD_TOOLS and result:
                 try:
                     parsed = json.loads(result) if isinstance(result, str) else result
+                    carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
+                    city_hint = call["input"].get("city") or call["input"].get("cityName") or call["input"].get("destination")
+
+                    cards: list[dict[str, Any]] = []
                     if parsed.get("success") and parsed.get("data"):
-                        carousel_type = PRODUCT_CARD_TOOLS[call["name"]]
                         cards = _extract_product_cards(parsed["data"], carousel_type)
-                        if cards:
-                            product_carousel = {
-                                "type": carousel_type,
-                                "title": _carousel_title(carousel_type, call["input"]),
-                                "cards": cards,
-                                "totalResults": len(cards),
-                            }
-                            metadata = {
-                                "hasCards": True,
-                                "cardType": carousel_type,
-                                "cardCount": len(cards),
-                                "totalResults": len(cards),
-                            }
+
+                    # Fallback to static database if API returned no usable cards
+                    if not cards:
+                        logger.info("[StreamAgent] No API cards for %s, using static fallback (city=%s)", carousel_type, city_hint)
+                        cards = _get_fallback_cards(carousel_type, city_hint)
+
+                    if cards:
+                        product_carousel = {
+                            "type": carousel_type,
+                            "title": _carousel_title(carousel_type, call["input"]),
+                            "cards": cards,
+                            "totalResults": len(cards),
+                        }
+                        metadata = {
+                            "hasCards": True,
+                            "cardType": carousel_type,
+                            "cardCount": len(cards),
+                            "totalResults": len(cards),
+                        }
                 except Exception:
                     logger.exception("[StreamAgent] Error parsing %s", call["name"])
 
@@ -727,9 +892,13 @@ async def run_agent_streaming(
             "metadata": metadata,
         }
 
+    # Generate contextual suggestions
+    suggestions = _generate_suggestions(user_message, final_reply, metadata)
+
     # Done event
     yield {
         "type": "done",
         "session_id": session_id,
         "metadata": metadata,
+        "suggestions": suggestions,
     }
