@@ -28,8 +28,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY app/ ./app/
-RUN mkdir -p ./data
-COPY data/ ./data/
+# RUN mkdir -p ./data
+# COPY data/ ./data/
 
 # Non-root user
 RUN adduser --disabled-password --gecos '' appuser && \
